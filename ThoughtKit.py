@@ -3,14 +3,18 @@ from pydantic import BaseModel, Field
 from openai import OpenAI
 from collections import deque
 import numpy as np
+import heapq
 
 # PARAMETERS
 DEBUG = False
+MODEL="gpt-4o-mini"
 #--------------------------------------------------------------------------------
 # Structure for the outputs
 
 class Status(BaseModel):
     status: str = Field(description="The status of the chain of thoughts. Either we should continue to reach a final asnwer, we should terminate this chain because it won't reach a final answer and it is going stray. If a we are ready for a final answer (regardless of correctness) return ready", enum=["continue", "terminate", "ready"])
+
+status2num = {"continue": 1, "terminate": 2, "ready": 0}
 
 class Thought(BaseModel):
     """A thought/step on how to solve the problem"""
@@ -42,6 +46,7 @@ class OpenAIParse(object):
         completion = self.client.beta.chat.completions.parse(
             model=self.model,
             temperature=temperature,
+            max_tokens=3000,
             messages=[
                 {"role": "system", "content": self.system_prompt},
                 {"role": "user", "content": prompt},
@@ -64,31 +69,31 @@ Chain of thoughts:
 - I am ready.
 """
 Thought_user_prompt = "User query: {query}\nChain of thoughts: {chain_of_thoughts}"
-Thought_model = OpenAIParse("gpt-4o-mini", Thought, Thought_system_prompt)
+Thought_model = OpenAIParse(MODEL, Thought, Thought_system_prompt)
 #--------------------------------------------------------------------------------
 Status_system_prompt = """
 Given the user query and the chain of thoughts, evaluate the chain of thoughts and determine the status of the chain of thoughts.
 The chain of thoughts is a series of thoughts that are generated to solve a problem.
 The chain of thoughts can be in one of three states: continue, terminate, ready."""
 Status_user_prompt = "User query: {query}\nChain of thoughts: {chain_of_thoughts}"
-Status_model = OpenAIParse("gpt-4o-mini", Status, Status_system_prompt)
+Status_model = OpenAIParse(MODEL, Status, Status_system_prompt)
 #--------------------------------------------------------------------------------
 Solution_system_prompt = """
 Given the user query and the chain of thoughts, generate the solution to the problem.
-The solution is the final answer to the problem."""
+The solution is the final answer to the problem and must follow the reasoning provided in the chain of thought."""
 Solution_user_prompt = "User query: {query}\nChain of thoughts: {chain_of_thoughts}"
-Solution_model = OpenAIParse("gpt-4o-mini", Solution, Solution_system_prompt)
+Solution_model = OpenAIParse(MODEL, Solution, Solution_system_prompt)
 #--------------------------------------------------------------------------------
 Equivalence_system_prompt = """
 Given two solutions and a user query, evaluate if the two solutions are equivalent."""
 Equivalence_user_prompt = "User query: {query}\nSolution 1: {solution_1}\nSolution 2: {solution_2}"
-Equivalence_model = OpenAIParse("gpt-4o-mini", Equivalence, Equivalence_system_prompt)
+Equivalence_model = OpenAIParse(MODEL, Equivalence, Equivalence_system_prompt)
 #--------------------------------------------------------------------------------
 Compare_system_prompt = """
 Given the user query, chain of thought and solution 1 and, chain of thought and solution 2, evaluate the solutions and determine the best solution.
 Note that the solutions are already generated and you are evaluating them. You should consider the logical reasoning, logical flow, and correctness of the solutions."""
 Compare_user_prompt = "User query: {query}\nSolutions 1: {solutions_1}\nSolutions 2: {solutions_2}"
-Compare_model = OpenAIParse("gpt-4o-mini", SolutionEvaluation, Compare_system_prompt)
+Compare_model = OpenAIParse(MODEL, SolutionEvaluation, Compare_system_prompt)
 #--------------------------------------------------------------------------------
 # chain of thoughts
 
@@ -114,6 +119,11 @@ class Chain(object):
         self.solution_model = solution_model
         self.solution = None
 
+    def clear(self):
+        self.head = None
+        self.tail = None
+        self.solution = None
+
     def set_status(self, node, query):
         """Set the status of the chain of thoughts"""
         node.status = self.status_model(
@@ -121,6 +131,7 @@ class Chain(object):
             )
 
     def __call__(self, query, T = 0 , max_length: int = 5):
+        self.clear()
         self.head = link(thought = query, status = Status(status="continue"))
         node = self.head
         for i in range(max_length):
@@ -140,13 +151,9 @@ class Chain(object):
             ).solution
         return self.solution
 
-class AnnealChain(Chain):
-    """A chain of thoughts to solve a problem using annealing"""
-    def __init__(self, status_model, thought_model, solution_model):
-        super().__init__(status_model, thought_model, solution_model)
-
-    def __call__(self, query, T_init = 1.5, max_length: int = 5):
+    def anneal(self, query, T_init = 1.5, max_length: int = 5):
         """Solve the problem using annealing"""
+        self.clear()
         self.head = link(thought = query, status = Status(status="continue"))
         node = self.head
         T_list = np.linspace(T_init, 0.0, max_length).tolist()
@@ -183,6 +190,9 @@ class Node(object):
             self.depth = parent.depth + 1
             self.parent = parent
             self.thoughts = parent.thoughts + [thought]
+    
+    def __lt__(self, other):
+        return len(self.thought) < len(other.thought) # for shortest path algorithms if the path length is the same, we can use the length of the thought
 
 class BinNode(Node):
     """A node in a binary tree of thoughts"""
@@ -197,7 +207,8 @@ class BinNode(Node):
 class Tree(object):
     """A tree of thoughts to solve a problem"""
     def __init__(self, status_model, thought_model, solution_model,
-                 equivalence_model = None, best_solution_model = None, max_depth: int = 5, max_children: int = 2):
+                 equivalence_model = None, best_solution_model = None, max_depth: int = 5,
+                 max_children: int = 2, max_num_solutions: int = 5):
         self.root = None
         self.leaves = deque([self.root]) # list of leaves
         self.status_model = status_model
@@ -210,6 +221,16 @@ class Tree(object):
         self.solution_model = solution_model
         self.equivalence_model = equivalence_model
         self.best_solution_model = best_solution_model
+        self._max_num_solutions = max_num_solutions # maximum number of solutions to generate (this affects how long the tree will be)
+        self._path_lengths = [] # for scored path methods similar to shortest path algorithms
+        heapq.heapify(self._path_lengths)
+
+    def clear(self):
+        self.root = None
+        self.leaves = deque([self.root])
+        self.solution_nodes = []
+        self.solutions = []
+        self.solution_thoughts = []
 
     def set_status(self, query):
         """Set the status of the chain of thoughts"""
@@ -245,12 +266,17 @@ class Tree(object):
                 unique_solutions.append(solution)
                 unique_solutions_thoughts.append(self.solution_thoughts[num])
             else:
-                for unique_solution in unique_solutions:
+                for unum, unique_solution in enumerate(unique_solutions):
                     if self.check_equivalence(query, solution, unique_solution):
+                        if self.compare_solution(query, solution, unique_solution) == "solution1": # If they are equivalent, keep the one with the best reasoning
+                            unique_solutions.remove(unique_solution)
+                            unique_solutions_thoughts.remove(unique_solutions_thoughts[unum])
+                            unique_solutions.append(solution)
+                            unique_solutions_thoughts.append(self.solution_thoughts[num])
                         break
-                else:
-                    unique_solutions.append(solution)
-                    unique_solutions_thoughts.append(self.solution_thoughts[num])
+                    else:
+                        unique_solutions.append(solution)
+                        unique_solutions_thoughts.append(self.solution_thoughts[num])
         self.solutions = unique_solutions
         self.solution_thoughts = unique_solutions_thoughts
 
@@ -276,10 +302,13 @@ class Tree(object):
             return (best_thoughts, best)
 
     def __call__(self, query, T=0):
+        self.clear()
         self.root = Node(thought = query, status = Status(status="continue"))
         node = self.root
         self.leaves = deque([self.root])
         for depth in range(self.max_depth):
+            if len(self.solution_nodes) >= self._max_num_solutions:
+                break
             while self.leaves and node.depth <= depth:
                 if DEBUG:
                     print(f"Current Depth: {node.depth} out of {self.max_depth}")
@@ -290,8 +319,50 @@ class Tree(object):
                         temperature = T)
                     node.children.append(Node(thought = thought.thought, parent = node))
                 self.leaves.extend(node.children)
-            self.set_status(query)
-            self.prune()
+                self.set_status(query)
+                self.prune()
+        if self.solution_nodes:
+            self.solutions = [self.solution_model(
+                Solution_user_prompt.format(query=query, chain_of_thoughts='\n-'.join(node.thoughts))
+                ).solution for node in self.solution_nodes]
+            self.solution_thoughts = [node.thoughts for node in self.solution_nodes]
+        elif self.leaves:
+            self.solutions = [self.solution_model(
+                Solution_user_prompt.format(query=query, chain_of_thoughts='\n-'.join(node.thoughts))
+                ).solution for node in self.leaves]
+            self.solution_thoughts = [node.thoughts for node in self.leaves]
+        else:
+            self.solutions = ["No solution found"]
+        if self.equivalence_model:
+            self.unique_solutions(query)
+        if self.best_solution_model:
+            best_thoughts, best = self.best_solution(query)
+        if not best:
+            return None, self.solutions
+        return best_thoughts, best
+    
+    def anneal(self, query, T_init = 1.5):
+        """Solve the problem using annealing"""
+        self.clear()
+        self.root = Node(thought = query, status = Status(status="continue"))
+        node = self.root
+        self.leaves = deque([self.root])
+        temp_list = np.linspace(T_init, 0.0, self.max_depth).tolist()
+        for depth, T in zip(range(self.max_depth), temp_list):
+            if len(self.solution_nodes) >= self._max_num_solutions:
+                break
+            while self.leaves and node.depth <= depth:
+                if DEBUG:
+                    print(f"Current Depth: {node.depth} out of {self.max_depth}; Temperature: {T}")
+                node = self.leaves.popleft()
+                for i in range(self.max_children):
+                    thought = self.thought_model(
+                        Thought_user_prompt.format(query=query, chain_of_thoughts='\n-'.join(node.thoughts)), 
+                        temperature = T)
+                    node.children.append(Node(thought = thought.thought, parent = node))
+                self.leaves.extend(node.children)
+                self.set_status(query)
+                self.prune()
         if self.solution_nodes:
             self.solutions = [self.solution_model(
                 Solution_user_prompt.format(query=query, chain_of_thoughts='\n-'.join(node.thoughts))
@@ -312,6 +383,47 @@ class Tree(object):
             return None, self.solutions
         return best_thoughts, best
 
+    def shortest_paths(self, query, max_paths_per_node = 5, max_t = 0):
+        """Find the solution with the preceived shortest path.
+        If max_t is not 0, then the temperature is randomly selected between 0 and max_t"""
+        self.clear()
+        self._max_path_per_node = max_paths_per_node
+        self.root = Node(thought = query, status = Status(status="continue"))
+        node = self.root
+        heapq.heappush(self._path_lengths, (0, node))
+        while len(self.solution_nodes) < self._max_num_solutions and node.depth < self.max_depth: # no explicit pruning or termination
+            if DEBUG:
+                print(f"Current Depth: {node.depth} out of {self.max_depth}")
+            path_score, node = heapq.heappop(self._path_lengths)
+            if node.status.status == "ready":
+                self.solution_nodes.append(node)
+            if max_t == 0:
+                temperture_list = [0] * self._max_path_per_node
+            else:
+                temperture_list = np.random.uniform(0, max_t, self._max_path_per_node).tolist()
+            for i in range(self._max_path_per_node):
+                thought = self.thought_model(
+                    Thought_user_prompt.format(query=query, chain_of_thoughts='\n-'.join(node.thoughts)), 
+                    temperature = temperture_list[i])
+                node.children.append(Node(thought = thought.thought, parent = node))
+                for child in node.children:
+                    child.status = self.status_model(Status_user_prompt.format(query=query, chain_of_thoughts='\n-'.join(child.thoughts))
+                    )
+                    heapq.heappush(self._path_lengths, (path_score + status2num[child.status.status], child))
+        if self.solution_nodes:
+            self.solutions = [self.solution_model(
+                Solution_user_prompt.format(query=query, chain_of_thoughts='\n-'.join(node.thoughts))
+                ).solution for node in self.solution_nodes]
+            self.solution_thoughts = [node.thoughts for node in self.solution_nodes]
+        else:
+            self.solutions = ["No solution found"]
+        if self.equivalence_model:
+            self.unique_solutions(query)
+        if self.best_solution_model:
+            best_thoughts, best = self.best_solution(query)
+        if not best:
+            return None, self.solutions
+        return best_thoughts, best
 class BinTree(Tree):
     """A binary tree of thoughts to solve a problem"""
     def __init__(
@@ -334,6 +446,8 @@ class BinTree(Tree):
         node = self.root
         self.leaves = deque([self.root])
         for depth in range(self.max_depth):
+            if len(self.solution_nodes) >= self._max_num_solutions:
+                break
             while self.leaves and node.depth <= self.max_depth:
                 if DEBUG:
                     print(f"Current Depth: {node.depth} out of {self.max_depth}")
@@ -347,8 +461,8 @@ class BinTree(Tree):
                     temperature = self.high_temp)
                 node.high_temp = BinNode(thought = thought.thought, parent = node, node_type = "Hot")
                 self.leaves.extend([node.low_temp, node.high_temp])
-            self.set_status(query)
-            self.prune()
+                self.set_status(query)
+                self.prune()
         if self.solution_nodes:
             self.solutions = [self.solution_model(
                 Solution_user_prompt.format(query=query, chain_of_thoughts='\n-'.join(node.thoughts))
@@ -361,51 +475,6 @@ class BinTree(Tree):
             self.solution_thoughts = [node.thoughts for node in self.leaves]
         else:
             self.solutions = ["No solution found"]        
-        if self.equivalence_model:
-            self.unique_solutions(query)
-        if self.best_solution_model:
-            best_thoughts, best = self.best_solution(query)
-        if not best:
-            return None, self.solutions
-        return best_thoughts, best
-    
-class AnnealTree(Tree):
-    """A tree of thoughts to solve a problem using annealing"""
-    def __init__(self, status_model, thought_model, solution_model,
-                 equivalence_model = None, best_solution_model = None, max_depth: int = 5):
-        super().__init__(status_model, thought_model, solution_model, equivalence_model, best_solution_model, max_depth)
-
-    def __call__(self, query, T_init = 1.5):
-        """Solve the problem using annealing"""
-        self.root = Node(thought = query, status = Status(status="continue"))
-        node = self.root
-        self.leaves = deque([self.root])
-        temp_list = np.linspace(T_init, 0.0, self.max_depth).tolist()
-        for depth, T in zip(range(self.max_depth), temp_list):
-            while self.leaves and node.depth <= depth:
-                if DEBUG:
-                    print(f"Current Depth: {node.depth} out of {self.max_depth}; Temperature: {T}")
-                node = self.leaves.popleft()
-                for i in range(self.max_children):
-                    thought = self.thought_model(
-                        Thought_user_prompt.format(query=query, chain_of_thoughts='\n-'.join(node.thoughts)), 
-                        temperature = T)
-                    node.children.append(Node(thought = thought.thought, parent = node))
-                self.leaves.extend(node.children)
-            self.set_status(query)
-            self.prune()
-        if self.solution_nodes:
-            self.solutions = [self.solution_model(
-                Solution_user_prompt.format(query=query, chain_of_thoughts='\n-'.join(node.thoughts))
-                ).solution for node in self.solution_nodes]
-            self.solution_thoughts = [node.thoughts for node in self.solution_nodes]
-        elif self.leaves:
-            self.solutions = [self.solution_model(
-                Solution_user_prompt.format(query=query, chain_of_thoughts='\n-'.join(node.thoughts))
-                ).solution for node in self.leaves]
-            self.solution_thoughts = [node.thoughts for node in self.leaves]
-        else:
-            self.solutions = ["No solution found"]
         if self.equivalence_model:
             self.unique_solutions(query)
         if self.best_solution_model:
