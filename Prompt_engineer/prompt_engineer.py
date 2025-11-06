@@ -23,10 +23,10 @@ import os
 EPSILON = 0.5  # exploration rate
 DROP_OUT = 0.5 # dropout rate for improvement actions
 NUM_FAILURE_CASES_TOSHOW = 10
-RANDOM_SEED = 42  # or any integer you prefer
+#RANDOM_SEED = 42  # or any integer you prefer
 TARGET_SCORE = 0.99
+RECURSION_LIMIT = 5000
 ##############################################
-random.seed(RANDOM_SEED)
 
 client = OpenAI()
 
@@ -77,30 +77,30 @@ def llm_call(prompt: PromptTemplateData, temperature=0.7, model: str = "gpt-4o")
 # Available improvement actions
 IMPROVEMENT_ACTIONS = [
     "Add examples: This is pertaining to few-shot prompting. Try not to add examples directly from the feedback. Instead, create new examples that are similar in nature to the feedback.",
-    "Remove examples: If the current examples are not helpful, consider removing them.",
-    "Add Chain of Thought reasoning: You can ask the model to think step-by-step, and output its reasoning. This may or may not improve the performance. You should consider removing it if it degrades the performance.",
+    "Remove examples: If you think the current examples are not helpful or are irrelevant, consider removing them.",
+    "Add Chain of Thought reasoning: You can ask the model to think step-by-step, and output its reasoning.",
     "Remove Chain of Thought reasoning: If the current prompt includes chain of thought reasoning, consider removing it.",
-    "Add specificity: A prompt or any aspect of a prompt can be more or less specific.",
-    "Remove specificity: A prompt or any aspect of a prompt can be more or less specific.",
+    "Add specificity: Give more specific instructions based on the feedback.",
+    "Remove specificity: Make the prompt more generic so that it considers a wider range of responses.",
     "Change wording: Rephrase parts of the prompt to improve clarity or effectiveness.",
-    "Add context: Context can be added or removed to provide more or less information to the model.",
-    "Remove context: Context can be added or removed to provide more or less information to the model.",
-    "Break the problem into subtasks: Consider breaking a complex problem into smaller, manageable subtasks, or consolidating subtasks into a single task if appropriate.",
+    "Add context: Context can be added to provide more information to the model.",
+    "Remove context: Context can be removed if you don't find it relevant to the feedback.",
+    "Break the problem into subtasks: Consider breaking a complex problem into smaller, manageable subproblems that collectively address the main issue.",
     "Define roles: Clearly specify the role the model should assume when generating a response.",
-    "Remove roles: Clearly specify the role the model should assume when generating a response.",
+    "Remove roles: Remove the role definition if you don't find it relevant to the feedback.",
     "Add constraints: Introduce constraints to guide the model's responses more effectively.",
-    "Remove constraints: Introduce constraints to guide the model's responses more effectively.",
-    "Ask for alternatives: Encourage the model to explore alternative solutions or perspectives.",
+    "Remove constraints: Remove constraints if you don't find them relevant to the feedback.",
     "Include negative examples: Provide examples of undesirable responses to help the model learn from mistakes.",
     "Add verification steps: Include steps for the model to verify its own answers.",
     "Remove verification steps: If the prompt includes verification steps, consider removing them.",
-    "Add specifying thinking style: Instruct the model on the preferred style of reasoning or explanation.",
     "Add including edge cases: Encourage the model to consider edge cases in its responses.",
     "Remove including edge cases: If the prompt includes edge cases, consider removing them.",
     "Add quality criteria: Specify the criteria that the model's responses should meet.",
     "Remove quality criteria: If the prompt includes quality criteria, consider removing them.",
     "Add requesting explanations: Ask the model to explain its reasoning or thought process.",
     "Remove requesting explanations: If the prompt includes requesting explanations, consider removing them.",
+    "Add decision trees: Write a prompt such that the model goes through a series of decisions to reach a conclusion.",
+    "Remove decision trees: If the prompt includes a decision tree process, consider removing it.",
     "Other: This is a catch-all for any other improvement action that may not fit the above categories.",
 ]
 
@@ -128,7 +128,7 @@ class PromptEngineerState(TypedDict):
 class ActionOutputFormat(BaseModel):
     """Output format for the action selection step."""
     cot: str = Field(..., description="Chain of thought reasoning for the selected action.")
-    action: str = Field(..., description="The selected action to apply to the current prompt.")
+    action: str = Field(..., description="The selected action to apply to the current prompt. You must return the complete action text as provided in the list of improvement actions.")
     action_reason: str = Field(..., description="Reason for selecting this action.")
 
 class ActionApplicationOutputFormat(BaseModel):
@@ -139,10 +139,10 @@ class ActionApplicationOutputFormat(BaseModel):
 # Define the action selection and action execution prompts
 # Define the action selection and action execution prompts
 
-action_selection_prompt = PromptTemplateData(
+movie_review_action_selection_prompt = PromptTemplateData(
         prompt="""Select an improvement action based on failure analysis: 
         Task:
-        Sentiment analysis of movie reviews. If the movie review is positive, return true, otherwise return false.
+        The prompt that you are engineering is for sentiment analysis of movie reviews. If the movie review is positive, it should return true, otherwise it should return false.
         Current Prompt:
         {current_prompt}
         Improvement Actions:
@@ -155,17 +155,17 @@ action_selection_prompt = PromptTemplateData(
         system_prompt=f"""You are an expert prompt engineer. Your task is to optimize prompts for the given task.
         You will be provided with a current prompt, performance metrics for the task, and a set of improvement actions.
         Your goal is to iteratively improve the prompt based on performance metrics and failure analysis.
+        - The performance metrics may help you identify a lack of balance in the model's performance (e.g., precision vs. recall).
+        - The failure examples will help you understand some of the specific cases where the model is failing.
         You will select an action to apply to the current prompt. A separate step will apply that action to generate a new prompt.
         Note that these actions will be used later to modify the prompt that an LLM will use to perform the task.
-        The purpose of the afformentioned prompt is sentiment analysis of movie reviews.
-        When choosing an action, consider the performance metrics and failure cases. You should think about why the model is failing on the specific failure cases provided and suggest an action accordingly.
-        Improvement actions you can choose from are:
+        You should think about why the model is failing on the specific failure cases provided and suggest an action accordingly.
         """,
         output_format=ActionOutputFormat,
         prompt_format_function=kwargs_format_function
     )
 
-action_application = PromptTemplateData(
+movie_review_action_application = PromptTemplateData(
         prompt="""Apply the selected action to the prompt for the following task, and performance metrics:
         Task:
         Sentiment analysis of movie reviews. If the movie review is positive, return true, otherwise return false.
@@ -182,15 +182,125 @@ action_application = PromptTemplateData(
         system_prompt=f"""You are a prompt engineer. 
         You are provided with a prompt which you will help improve such that an llm performs well on a given task. 
         Your job is to improve a prompt based on a preselection improvement action and a set of existing performance metrics performance metrics.
+        - The performance metrics may help you identify a lack of balance in the model's performance (e.g., precision vs. recall).
+        - The failure examples will help you understand some of the specific cases where the model is failing.
         You should provide the new prompt that results from applying the action that you are provided with to the current prompt.
         Make sure the new prompt is clear, concise, and effectively incorporates the selected improvement action.
         Do not change any other aspect of the prompt except for applying the selected improvement action.
-        when applying the action, consider the performance metrics and failure cases. You should think about why the model is failing on the specific failure cases provided and modify the prompt accordingly.
-        The improvement action you will be provided with will be one of the following: {', '.join(IMPROVEMENT_ACTIONS)}""",
+        You should think about why the model is failing on the specific failure cases provided and modify the prompt accordingly.
+        Make sure that while applying the action, you do not remove the input text place holder at the end of the prompt.
+        """,
         output_format=ActionApplicationOutputFormat,
         prompt_format_function=kwargs_format_function
     )
 
+esnli_action_selection_prompt = PromptTemplateData(
+        prompt="""Select an improvement action based on failure analysis: 
+        Task:
+        The prompt that you are engineering is for natural language inference on the e-SNLI dataset. Given a premise and a hypothesis, the model should classify the relationship as entailment, contradiction, or neutral.
+        each failure example is formatted as follows:
+        Premise: <premise text> | Hypothesis: <hypothesis text> | Predicted: <predicted label> | Actual: <actual label> | Explanation: <explanation of the prediction>
+        Current Prompt:
+        {current_prompt}
+        Improvement Actions:
+        {improvement_actions}
+        Performance Metrics:
+        {performance_metrics}
+        Some Failure Examples:
+        {failure_cases}
+        """,
+        system_prompt=f"""You are an expert prompt engineer. Your task is to optimize prompts for the given task.
+        You will be provided with a current prompt, performance metrics for the task, and a set of improvement actions.
+        Your goal is to iteratively improve the prompt based on performance metrics and failure analysis.
+        - The performance metrics may help you identify a lack of balance in the model's performance (e.g., precision vs. recall).
+        - The failure examples will help you understand some of the specific cases where the model is failing.
+        You will select an action to apply to the current prompt. A separate step will apply that action to generate a new prompt.
+        Note that these actions will be used later to modify the prompt that an LLM will use to perform the task.
+        You should think about why the model is failing on the specific failure cases provided and suggest an action accordingly.
+        """,
+        output_format=ActionOutputFormat,
+        prompt_format_function=kwargs_format_function
+    )
+
+esnli_action_application = PromptTemplateData(
+        prompt="""Apply the selected action to the prompt for the following task, and performance metrics:
+        Task:
+        The prompt that you are engineering is for natural language inference on the e-SNLI dataset. Given a premise and a hypothesis, the model should classify the relationship as entailment, contradiction, or neutral.
+        each failure example is formatted as follows:
+        Premise: <premise text> | Hypothesis: <hypothesis text> | Predicted: <predicted label> | Actual: <actual label> | Explanation: <explanation of the prediction>
+        Selected Action: 
+        {selected_action}
+        Selected Action Reason:
+        {selected_action_reason} 
+        Current Prompt: 
+        {current_prompt}
+        Performance Metrics:
+        {performance_metrics}
+        Some Failure Examples:
+        {failure_cases}""",
+        system_prompt=f"""You are a prompt engineer. 
+        You are provided with a prompt which you will help improve such that an llm performs well on a given task. 
+        Your job is to improve a prompt based on a preselection improvement action and a set of existing performance metrics performance metrics.
+        - The performance metrics may help you identify a lack of balance in the model's performance (e.g., precision vs. recall).
+        - The failure examples will help you understand some of the specific cases where the model is failing.
+        You should provide the new prompt that results from applying the action that you are provided with to the current prompt.
+        Make sure the new prompt is clear, concise, and effectively incorporates the selected improvement action.
+        Do not change any other aspect of the prompt except for applying the selected improvement action.
+        You should think about why the model is failing on the specific failure cases provided and modify the prompt accordingly.
+        Make sure that while applying the action, you do not remove the input text place holder at the end of the prompt.
+        """,
+        output_format=ActionApplicationOutputFormat,
+        prompt_format_function=kwargs_format_function
+    )
+
+##############################################
+# RAG Prompt
+##############################################
+
+class RAGOutputFormat(BaseModel):
+    """Output format for the action application step."""
+    cot: str = Field(..., description="Chain of thought reasoning for the query generation.")
+    query_1: str = Field(..., description="first query to retrieve relevant documents.")
+    query_2: str = Field(..., description="second query to retrieve relevant documents.")
+    query_3: str = Field(..., description="third query to retrieve relevant documents.")
+
+
+rag_prompt = PromptTemplateData(
+        prompt="""Apply the selected action to the prompt for the following task, and performance metrics:
+        Task:
+        {task_description}
+        Current Prompt: 
+        {current_prompt}
+        Some Failure Examples:
+        {failure_cases}""",
+        system_prompt=f"""You are helping a prompt engineer by retrieving relevant documents that can help improve a prompt for a given task. 
+        You will be provided with a current prompt, a set of failure cases, and the task description.
+        Your job is to generate 3 key questions that can help retrieve relevant documents from a knowledge base. These documents will be used to improve the prompt.
+        Make sure the questions are clear, concise, and relevant to the task and failure cases.
+        """,
+        output_format=RAGOutputFormat,
+        prompt_format_function=kwargs_format_function
+    )
+
+rag_output_evaluator = PromptTemplateData(
+        prompt="""Apply the selected action to the prompt for the following task, and performance metrics:
+        Task:
+        {task_description}
+        Current Prompt: 
+        {current_prompt}
+        Some Failure Examples:
+        {failure_cases}""",
+        system_prompt=f"""You are helping a prompt engineer by retrieving relevant documents that can help improve a prompt for a given task. 
+        You will be provided with a current prompt, a set of failure cases, and the task description.
+        Your job is to generate 3 key questions that can help retrieve relevant documents from a knowledge base. These documents will be used to improve the prompt.
+        Make sure the questions are clear, concise, and relevant to the task and failure cases.
+        """,
+        output_format=RAGOutputFormat,
+        prompt_format_function=kwargs_format_function
+    )
+##############################################
+# Prompt Optimizer Class
+##############################################
 class PromptOptimizer:
     def __init__(
         self,
@@ -204,9 +314,11 @@ class PromptOptimizer:
         train_test_ratio: float = 0.5,
         epsilon: float = EPSILON,  # exploration rate
         epsilon_decay: float = 0.98,  # decay rate for epsilon
-        min_epsilon: float = 0.2,  # minimum exploration rate
+        min_epsilon: float = 0,  # minimum exploration rate
         drop_out: float = DROP_OUT,  # dropout rate for improvement actions
         max_iterations: int = 20,
+        model: str = "gpt-4o",
+        rag: bool = False,
     ):
         #self.failure_analysis = failure_analysis
         self.action_selection = action_selection
@@ -222,28 +334,42 @@ class PromptOptimizer:
         # Epsilon-greedy parameters
         self.epsilon = epsilon
         self.epsilon_decay = epsilon_decay
-        self.min_epsilon = min_epsilon
+        self.min_epsilon = min_epsilon if epsilon > 0 else 0
 
         # Dropout parameters
         self.drop_out = drop_out
         # Max iterations
         self.max_iterations = max_iterations
+        # LLM model
+        self.model = model
 
         # Build the workflow
         self.workflow = StateGraph(PromptEngineerState)
         self.workflow.add_node("evaluate", self.evaluate_prompt_node)
         #self.workflow.add_node("analyze_failures", self.analyze_failures_node)
         self.workflow.add_node("epsilon_greedy_choice", self.epsilon_greedy_choice_node)
+        if rag:
+            self.workflow.add_node("rag_retrieve", self.rag_retrieve_node)
         self.workflow.add_node("select_action", self.select_action_node)
         self.workflow.add_node("apply_action", self.apply_action_node)
 
         #self.workflow.add_edge("evaluate", "analyze_failures")
         self.workflow.add_edge("evaluate", "epsilon_greedy_choice")
-        self.workflow.add_edge("epsilon_greedy_choice", "select_action")
+        if not rag:
+            self.workflow.add_edge("epsilon_greedy_choice", "select_action")
+        else:
+            self.workflow.add_edge("epsilon_greedy_choice", "rag_retrieve")
+            self.workflow.add_edge("rag_retrieve", "select_action")
         self.workflow.add_edge("select_action", "apply_action")
         self.workflow.add_conditional_edges("apply_action", self.should_continue)
         self.workflow.set_entry_point("evaluate")
         self.app = self.workflow.compile()
+
+    def rag_retrieve_node(self, state: PromptEngineerState) -> PromptEngineerState:
+        # Placeholder for RAG retrieval logic
+        print("🔍 Retrieving relevant documents using RAG")
+        # For now, we just pass the state through
+        return state
 
     def evaluate_prompt_node(self, state: PromptEngineerState) -> PromptEngineerState:
         print(f"current prompt: {state['current_prompt'].prompt}")
@@ -281,7 +407,7 @@ class PromptOptimizer:
             "recall": recall,
             "precision": precision,
             "f1_score": f1_score,
-            "false_positive_rate": false_positive_rate,
+            #"false_positive_rate": false_positive_rate,
             "failure_cases": failure_cases
         }
         
@@ -350,6 +476,7 @@ class PromptOptimizer:
         
         # Using validation metrics but training failure cases to avoid overfitting
         llm_action_output = llm_call(
+            model=self.model,
             prompt=self.action_selection(
             current_prompt=state["current_prompt"].prompt,
             improvement_actions='\n'.join([f"> {action}" for action in self.action_list]),
@@ -381,6 +508,7 @@ class PromptOptimizer:
         
         # Using validation metrics but training failure cases to avoid overfitting
         llm_new_prompt_output = llm_call(
+            model=self.model,
             prompt=self.action_application(
                 selected_action=action,
                 selected_action_reason = selected_action_reason,
@@ -464,7 +592,7 @@ class PromptOptimizer:
             "selected_action_reason": "",
             "epsilon_choice": ""
         }
-        final_state = self.app.invoke(initial_state, {"recursion_limit": 1000})
+        final_state = self.app.invoke(initial_state, {"recursion_limit": RECURSION_LIMIT})
         return final_state
     
 ##############################################
