@@ -372,9 +372,12 @@ class PromptOptimizer:
         return state
 
     def evaluate_prompt_node(self, state: PromptEngineerState) -> PromptEngineerState:
+        import sys
+        sys.stdout.flush()  # Flush before printing
         print(f"current prompt: {state['current_prompt'].prompt}")
         print("========================================")
         print(f"🔍 Evaluating prompt (iteration {state['iteration_count']})")
+        sys.stdout.flush()  # Flush after printing
         
         # Generate metrics
         metrics = self.evaluation_method(state["current_prompt"], self.training_dataset)
@@ -438,16 +441,21 @@ class PromptOptimizer:
 
     def epsilon_greedy_choice_node(self, state: PromptEngineerState) -> PromptEngineerState:
         """Epsilon-greedy choice: continue current prompt with prob epsilon, or use best prompt with prob 1-epsilon"""
+        import sys
+        import uuid
+        call_id = str(uuid.uuid4())[:8]
         current_epsilon = max(self.min_epsilon, self.epsilon * (self.epsilon_decay ** state["iteration_count"]))
         
         if random.random() < current_epsilon:
             # Explore: continue with current prompt
-            print(f"🔍 Exploring - continuing with current prompt (ε={current_epsilon:.3f})")
+            print(f"[{call_id}] 🔍 Exploring - continuing with current prompt (ε={current_epsilon:.3f})")
+            sys.stdout.flush()
             choice = "explore"
             chosen_prompt = state["current_prompt"]
         else:
             # Exploit: use best known prompt
-            print(f"💰 Exploiting - using best known prompt (ε={current_epsilon:.3f})")
+            print(f"[{call_id}] 💰 Exploiting - using best known prompt (ε={current_epsilon:.3f})")
+            sys.stdout.flush()
             choice = "exploit"
             chosen_prompt = state["best_prompt"] if state["best_prompt"] else state["current_prompt"]
         
@@ -458,7 +466,11 @@ class PromptOptimizer:
         }
 
     def select_action_node(self, state: PromptEngineerState) -> PromptEngineerState:
-        print("🤖 Selecting improvement action")
+        import sys
+        import uuid
+        call_id = str(uuid.uuid4())[:8]
+        print(f"[{call_id}] 🤖 Selecting improvement action")
+        sys.stdout.flush()
         
         metrics = state["performance_metrics"]
         
@@ -491,7 +503,9 @@ class PromptOptimizer:
         selected_action_reason = llm_action_output.action_reason
         assert selected_action_reason is not None, "LLM did not return a valid action reason. Please check the action selection prompt and the LLM response format."
 
-        print(f"🎯 Selected action: {selected_action}")
+        import sys
+        print(f"[{call_id}] 🎯 Selected action: {selected_action}")
+        sys.stdout.flush()
         return {
             **state,
             "selected_action": selected_action,
@@ -499,7 +513,11 @@ class PromptOptimizer:
         }
 
     def apply_action_node(self, state: PromptEngineerState) -> PromptEngineerState:
-        print(f"⚡ Applying action: {state['selected_action']}")
+        import sys
+        import uuid
+        call_id = str(uuid.uuid4())[:8]
+        print(f"[{call_id}] ⚡ Applying action: {state['selected_action']}")
+        sys.stdout.flush()
         action = state["selected_action"]
         selected_action_reason = state["selected_action_reason"]
         current_prompt = state["current_prompt"].prompt  # Extract the prompt string
@@ -578,6 +596,12 @@ class PromptOptimizer:
             self.app.get_graph().print_ascii()
     
     def run(self) -> PromptEngineerState:
+        import uuid
+        run_id = str(uuid.uuid4())[:8]
+        print(f"\n{'='*80}")
+        print(f"[RUN-{run_id}] Starting PromptOptimizer.run()")
+        print(f"{'='*80}\n")
+        
         initial_state: PromptEngineerState = {
             "current_prompt": self.initial_prompt,
             "performance_metrics_string": "",
@@ -593,6 +617,10 @@ class PromptOptimizer:
             "epsilon_choice": ""
         }
         final_state = self.app.invoke(initial_state, {"recursion_limit": RECURSION_LIMIT})
+        
+        print(f"\n{'='*80}")
+        print(f"[RUN-{run_id}] Finished PromptOptimizer.run()")
+        print(f"{'='*80}\n")
         return final_state
     
 ##############################################
@@ -689,16 +717,21 @@ def plot_validation_f1_scores():
     print("Plot saved as 'validation_f1_comparison.png'")
 
 def plot_cumulative_max_f1_scores():
-    # Find all JSON files matching the pattern
-    json_files = glob.glob("epsilon_*_max_*_iter_*.json")
+    # Find all JSON files in both experiment folders
+    movie_files = glob.glob("movie_review_experiment/epsilon_*_max_*_iter_*.json")
+    esnli_files = glob.glob("esnli_experiment/epsilon_*_max_*_iter_*.json")
     
-    if not json_files:
-        print("No JSON files found matching the pattern 'epsilon_*_max_*_iter_*.json'")
+    if not movie_files and not esnli_files:
+        print("No JSON files found in experiment folders")
         return
     
-    plt.figure(figsize=(12, 8))
+    fig, axes = plt.subplots(1, 2, figsize=(18, 8))
     
-    for json_file in json_files:
+    # Process Movie Review experiment
+    ax = axes[0]
+    ax.set_title('Movie Review Experiment', fontsize=16, fontweight='bold')
+    
+    for json_file in sorted(movie_files):
         try:
             # Extract epsilon and dropout from filename
             match = re.search(r'epsilon_([0-9.]+)_max_([0-9.]+)_iter_([0-9]+)\.json', json_file)
@@ -730,33 +763,93 @@ def plot_cumulative_max_f1_scores():
                 print(f"No validation F1 scores found in {json_file}")
                 continue
             
-            # Calculate cumulative maximum - THIS IS THE KEY LINE!
+            # Calculate cumulative maximum
             cumulative_max_scores = np.maximum.accumulate(validation_f1_scores)
             
             # Create label for the plot
             label = f"ε={epsilon}, dropout={dropout}"
             
-            # Plot the CUMULATIVE MAXIMUM line (not the raw scores)
-            plt.plot(iterations, cumulative_max_scores, marker='o', markersize=4, 
-                    label=label, linewidth=2, alpha=0.8)
+            # Plot the CUMULATIVE MAXIMUM line
+            ax.plot(iterations, cumulative_max_scores, marker='o', markersize=5, 
+                    label=label, linewidth=2.5, alpha=0.8)
             
-            print(f"Loaded {json_file}: {len(iterations)} iterations, "
+            print(f"Movie Review - {json_file}: {len(iterations)} iterations, "
                   f"final best F1: {cumulative_max_scores[-1]:.3f}")
             
         except Exception as e:
             print(f"Error processing {json_file}: {e}")
     
-    # Customize the plot
-    plt.xlabel('Iteration', fontsize=12)
-    plt.ylabel('Best Validation F1 Score So Far', fontsize=12)
-    plt.title('Cumulative Best Validation F1 Score Over Iterations\nby Epsilon and Dropout Parameters', fontsize=14)
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.grid(True, alpha=0.3)
+    ax.set_xlabel('Iteration', fontsize=14)
+    ax.set_ylabel('Best Validation F1 Score So Far', fontsize=14)
+    ax.legend(fontsize=11, loc='best')
+    ax.grid(True, alpha=0.3)
+    ax.tick_params(axis='both', which='major', labelsize=12)
+    
+    # Process e-SNLI experiment
+    ax = axes[1]
+    ax.set_title('e-SNLI Experiment', fontsize=16, fontweight='bold')
+    
+    for json_file in sorted(esnli_files):
+        try:
+            # Extract epsilon and dropout from filename
+            match = re.search(r'epsilon_([0-9.]+)_max_([0-9.]+)_iter_([0-9]+)\.json', json_file)
+            if match:
+                epsilon = float(match.group(1))
+                dropout = float(match.group(2))
+                max_iter = int(match.group(3))
+            else:
+                print(f"Could not parse filename: {json_file}")
+                continue
+            
+            # Load the JSON file
+            with open(json_file, 'r') as f:
+                data = json.load(f)
+            
+            # Extract validation F1 scores from search history
+            iterations = []
+            validation_f1_scores = []
+            
+            for entry in data.get('search_history', []):
+                iteration = entry.get('iteration', 0)
+                metrics = entry.get('metrics', {})
+                val_f1 = metrics.get('validation_f1_score', 0)
+                
+                iterations.append(iteration)
+                validation_f1_scores.append(val_f1)
+            
+            if not validation_f1_scores:
+                print(f"No validation F1 scores found in {json_file}")
+                continue
+            
+            # Calculate cumulative maximum
+            cumulative_max_scores = np.maximum.accumulate(validation_f1_scores)
+            
+            # Create label for the plot
+            label = f"ε={epsilon}, dropout={dropout}"
+            
+            # Plot the CUMULATIVE MAXIMUM line
+            ax.plot(iterations, cumulative_max_scores, marker='s', markersize=5, 
+                    label=label, linewidth=2.5, alpha=0.8, linestyle='--')
+            
+            print(f"e-SNLI - {json_file}: {len(iterations)} iterations, "
+                  f"final best F1: {cumulative_max_scores[-1]:.3f}")
+            
+        except Exception as e:
+            print(f"Error processing {json_file}: {e}")
+    
+    ax.set_xlabel('Iteration', fontsize=14)
+    ax.set_ylabel('Best Validation F1 Score So Far', fontsize=14)
+    ax.legend(fontsize=11, loc='best')
+    ax.grid(True, alpha=0.3)
+    ax.tick_params(axis='both', which='major', labelsize=12)
+    
+    # Overall title
+    fig.suptitle('Cumulative Best Validation F1 Score Over Iterations', fontsize=18, fontweight='bold', y=0.98)
     plt.tight_layout()
+    
+    # SAVE BEFORE SHOWING (this was the bug!)
+    plt.savefig('cumulative_max_f1_comparison.png', dpi=300, bbox_inches='tight')
+    print("\nPlot saved as 'cumulative_max_f1_comparison.png'")
     
     # Show the plot
     plt.show()
-    
-    # Also save the plot
-    plt.savefig('cumulative_max_f1_comparison.png', dpi=300, bbox_inches='tight')
-    print("Plot saved as 'cumulative_max_f1_comparison.png'")
